@@ -1,0 +1,677 @@
+const APP_VERSION = "2026-06-14-cloud-sessions-v1";
+const MAIN_SESSION_PREFIX = "session:";
+const SEATS = ["N", "E", "S", "W"];
+const PARTNER_SEATS = ["N", "S"];
+const OPPONENT_SEATS = ["E", "W"];
+const FILTER_TARGETS = ["N", "S", "E", "W", "NZ"];
+const SUITS = ["S", "H", "D", "C"];
+const STRAINS = ["C", "D", "H", "S", "NT"];
+const RANKS = ["A", "K", "Q", "J", "10", "9", "8", "7", "6", "5", "4", "3", "2"];
+const DEALER_CYCLE = ["N", "E", "S", "W"];
+const VULNERABILITY_CYCLE = [
+  "Niemand",
+  "NZ",
+  "OW",
+  "Allen",
+  "NZ",
+  "OW",
+  "Allen",
+  "Niemand",
+  "OW",
+  "Allen",
+  "Niemand",
+  "NZ",
+  "Allen",
+  "Niemand",
+  "NZ",
+  "OW",
+];
+const SUIT_SYMBOLS = { S: "\u2660", H: "\u2665", D: "\u2666", C: "\u2663" };
+const SEAT_NAMES = { N: "Noord", E: "Oost", S: "Zuid", W: "West" };
+
+let memoryStates = new Map();
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function defaultSettings() {
+  const filters = {};
+  for (const target of FILTER_TARGETS) {
+    filters[target] = { minHcp: 0, minSuitLengths: { S: 0, H: 0, D: 0, C: 0 } };
+  }
+  return { dealerMode: "cycle", opponentMode: "pass", filters };
+}
+
+function makeDeck() {
+  return SUITS.flatMap((suit) => RANKS.map((rank) => ({ suit, rank })));
+}
+
+function shuffle(items) {
+  const copy = [...items];
+  for (let index = copy.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [copy[index], copy[swapIndex]] = [copy[swapIndex], copy[index]];
+  }
+  return copy;
+}
+
+function sortHand(hand) {
+  return [...hand].sort((left, right) => {
+    const suitDiff = SUITS.indexOf(left.suit) - SUITS.indexOf(right.suit);
+    return suitDiff || RANKS.indexOf(left.rank) - RANKS.indexOf(right.rank);
+  });
+}
+
+function dealerForBoard(board, dealerMode) {
+  if (dealerMode === "cycle") return DEALER_CYCLE[(board - 1) % DEALER_CYCLE.length];
+  if (dealerMode === "random") return SEATS[Math.floor(Math.random() * SEATS.length)];
+  return SEATS.includes(dealerMode) ? dealerMode : DEALER_CYCLE[(board - 1) % DEALER_CYCLE.length];
+}
+
+function createRawDeal(board, dealer) {
+  const deck = shuffle(makeDeck());
+  const hands = { N: [], E: [], S: [], W: [] };
+  deck.forEach((card, index) => hands[SEATS[index % SEATS.length]].push(card));
+  return {
+    board,
+    dealer,
+    vulnerability: VULNERABILITY_CYCLE[(board - 1) % VULNERABILITY_CYCLE.length],
+    hands: {
+      N: sortHand(hands.N),
+      E: sortHand(hands.E),
+      S: sortHand(hands.S),
+      W: sortHand(hands.W),
+    },
+    attempts: 1,
+    matchedFilters: true,
+  };
+}
+
+function handStats(hand) {
+  const points = { A: 4, K: 3, Q: 2, J: 1 };
+  const distribution = { S: 0, H: 0, D: 0, C: 0 };
+  let hcp = 0;
+  for (const card of hand) {
+    hcp += points[card.rank] || 0;
+    distribution[card.suit] += 1;
+  }
+  const counts = Object.values(distribution).sort((left, right) => right - left).join("-");
+  return {
+    hcp,
+    distribution,
+    shape: SUITS.map((suit) => distribution[suit]).join("-"),
+    balanced: counts === "4-3-3-3" || counts === "4-4-3-2" || counts === "5-3-3-2",
+  };
+}
+
+function targetHand(deal, target) {
+  return target === "NZ" ? [...deal.hands.N, ...deal.hands.S] : deal.hands[target];
+}
+
+function normalizeInt(value, maximum) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(0, Math.min(maximum, Math.round(parsed))) : 0;
+}
+
+function normalizeSettings(raw) {
+  const settings = defaultSettings();
+  const source = raw && typeof raw === "object" ? raw : {};
+  settings.dealerMode = ["cycle", "random", ...SEATS].includes(source.dealerMode) ? source.dealerMode : "cycle";
+  settings.opponentMode = ["pass", "auto"].includes(source.opponentMode) ? source.opponentMode : "pass";
+
+  const rawFilters = source.filters && typeof source.filters === "object" ? source.filters : {};
+  for (const target of FILTER_TARGETS) {
+    const filter = rawFilters[target] && typeof rawFilters[target] === "object" ? rawFilters[target] : {};
+    settings.filters[target].minHcp = normalizeInt(filter.minHcp, target === "NZ" ? 40 : 37);
+    const lengths = filter.minSuitLengths && typeof filter.minSuitLengths === "object" ? filter.minSuitLengths : {};
+    for (const suit of SUITS) {
+      settings.filters[target].minSuitLengths[suit] = normalizeInt(lengths[suit], target === "NZ" ? 26 : 13);
+    }
+  }
+  return settings;
+}
+
+function dealMatchesFilters(deal, settings) {
+  for (const target of FILTER_TARGETS) {
+    const filter = settings.filters[target];
+    const stats = handStats(targetHand(deal, target));
+    if (stats.hcp < filter.minHcp) return false;
+    for (const suit of SUITS) {
+      if (stats.distribution[suit] < filter.minSuitLengths[suit]) return false;
+    }
+  }
+  return true;
+}
+
+function createDeal(board, settings) {
+  let fallback = createRawDeal(board, dealerForBoard(board, settings.dealerMode));
+  for (let attempts = 1; attempts <= 4000; attempts += 1) {
+    const candidate = createRawDeal(board, dealerForBoard(board, settings.dealerMode));
+    if (dealMatchesFilters(candidate, settings)) {
+      candidate.attempts = attempts;
+      candidate.matchedFilters = true;
+      return candidate;
+    }
+    fallback = candidate;
+  }
+  fallback.attempts = 4000;
+  fallback.matchedFilters = false;
+  return fallback;
+}
+
+function currentSeat(dealer, auction) {
+  return SEATS[(SEATS.indexOf(dealer) + auction.length) % SEATS.length];
+}
+
+function isContract(call) {
+  return call !== "P";
+}
+
+function bidParts(bid) {
+  return [Number(bid.slice(0, 1)), bid.slice(1)];
+}
+
+function bidValue(bid) {
+  const [level, strain] = bidParts(bid);
+  return level * STRAINS.length + STRAINS.indexOf(strain);
+}
+
+function lastContract(auction) {
+  for (let index = auction.length - 1; index >= 0; index -= 1) {
+    if (isContract(auction[index].call)) return auction[index];
+  }
+  return null;
+}
+
+function isHigherBid(candidate, auction) {
+  const previous = lastContract(auction);
+  return !previous || bidValue(candidate) > bidValue(previous.call);
+}
+
+function allContractBids() {
+  const bids = [];
+  for (let level = 1; level <= 7; level += 1) {
+    for (const strain of STRAINS) bids.push(`${level}${strain}`);
+  }
+  return bids;
+}
+
+function isAuctionComplete(auction) {
+  if (auction.length < 4) return false;
+  if (auction.slice(-4).every((entry) => entry.call === "P")) return true;
+  return Boolean(lastContract(auction) && auction.slice(-3).every((entry) => entry.call === "P"));
+}
+
+function displayCall(call) {
+  if (call === "P") return "Pas";
+  const [level, strain] = bidParts(call);
+  return strain === "NT" ? `${level}SA` : `${level}${SUIT_SYMBOLS[strain]}`;
+}
+
+function chooseOpeningSuit(stats) {
+  const majors = ["S", "H"].filter((suit) => stats.distribution[suit] >= 5);
+  if (majors.length) return majors.sort((left, right) => stats.distribution[right] - stats.distribution[left])[0];
+  return ["D", "C"].sort((left, right) => stats.distribution[right] - stats.distribution[left] || (left === "D" ? -1 : 1))[0];
+}
+
+function longestSuit(stats) {
+  return [...SUITS].sort((left, right) => stats.distribution[right] - stats.distribution[left])[0];
+}
+
+function lowestLegalBid(strain, auction, minimumLevel = 1) {
+  for (let level = minimumLevel; level <= 7; level += 1) {
+    const bid = `${level}${strain}`;
+    if (isHigherBid(bid, auction)) return bid;
+  }
+  return null;
+}
+
+function simpleAutoBid(seat, hand, auction, partnership) {
+  const stats = handStats(hand);
+  if (!lastContract(auction)) {
+    if (stats.balanced && stats.hcp >= 15 && stats.hcp <= 17) return "1NT";
+    if (stats.hcp >= 12) return `1${chooseOpeningSuit(stats)}`;
+    const long = longestSuit(stats);
+    if (stats.hcp >= 6 && stats.hcp <= 10 && stats.distribution[long] >= 6) {
+      return `${stats.distribution[long] === 6 ? 2 : 3}${long}`;
+    }
+    return "P";
+  }
+
+  const partnerBid = [...auction]
+    .reverse()
+    .find((entry) => partnership.includes(entry.seat) && entry.seat !== seat && isContract(entry.call));
+  if (!partnerBid) return stats.hcp >= 12 ? lowestLegalBid(chooseOpeningSuit(stats), auction) || "P" : "P";
+  const [level, strain] = bidParts(partnerBid.call);
+  if (["H", "S"].includes(strain) && stats.distribution[strain] >= 3 && stats.hcp >= 6) {
+    const targetLevel = stats.hcp >= 13 ? 4 : stats.hcp >= 10 ? 3 : 2;
+    return lowestLegalBid(strain, auction, Math.max(targetLevel, level)) || "P";
+  }
+  if (stats.hcp >= 8) return lowestLegalBid(longestSuit(stats), auction) || "P";
+  return "P";
+}
+
+function processAutoOpponents(session, pairState) {
+  let guard = 0;
+  while (
+    !isAuctionComplete(pairState.auction) &&
+    OPPONENT_SEATS.includes(currentSeat(session.deal.dealer, pairState.auction)) &&
+    guard < 20
+  ) {
+    const seat = currentSeat(session.deal.dealer, pairState.auction);
+    let call = "P";
+    if (session.settings.opponentMode === "auto") {
+      call = simpleAutoBid(seat, session.deal.hands[seat], pairState.auction, OPPONENT_SEATS);
+      if (isContract(call) && !isHigherBid(call, pairState.auction)) call = "P";
+    }
+    pairState.auction.push({ seat, call });
+    guard += 1;
+  }
+}
+
+function sideForSeat(seat) {
+  return PARTNER_SEATS.includes(seat) ? "NZ" : "OW";
+}
+
+function seatsForSide(side) {
+  return side === "NZ" ? PARTNER_SEATS : OPPONENT_SEATS;
+}
+
+function sideVulnerable(side, vulnerability) {
+  return vulnerability === "Allen" || (side === "NZ" && vulnerability === "NZ") || (side === "OW" && vulnerability === "OW");
+}
+
+function declarerForFinalContract(auction) {
+  const contract = lastContract(auction);
+  if (!contract) return null;
+  const [, strain] = bidParts(contract.call);
+  const sideSeats = seatsForSide(sideForSeat(contract.seat));
+  for (const entry of auction) {
+    if (sideSeats.includes(entry.seat) && isContract(entry.call) && bidParts(entry.call)[1] === strain) return entry.seat;
+  }
+  return contract.seat;
+}
+
+function contractScoreMade(bid, vulnerable) {
+  const [level, strain] = bidParts(bid);
+  const perTrick = ["C", "D"].includes(strain) ? 20 : 30;
+  const contractPoints = strain === "NT" ? 40 + Math.max(0, level - 1) * 30 : level * perTrick;
+  const gameBonus = contractPoints >= 100 ? (vulnerable ? 500 : 300) : 50;
+  const slamBonus = level === 6 ? (vulnerable ? 750 : 500) : level === 7 ? (vulnerable ? 1500 : 1000) : 0;
+  return contractPoints + gameBonus + slamBonus;
+}
+
+function scoreForNz(score, side) {
+  return side === "NZ" ? score : -score;
+}
+
+function combinedHand(deal, side) {
+  return seatsForSide(side).flatMap((seat) => deal.hands[seat]);
+}
+
+function estimateTricks(deal, side, strain) {
+  const stats = handStats(combinedHand(deal, side));
+  let estimate = 6 + (stats.hcp - 18) / 2.7;
+  if (strain !== "NT") {
+    const fit = stats.distribution[strain];
+    if (fit >= 8) estimate += 0.8;
+    if (fit >= 9) estimate += 0.5;
+    if (fit >= 10) estimate += 0.4;
+    if (fit <= 6) estimate -= 0.8;
+  } else if (stats.balanced) {
+    estimate += 0.25;
+  }
+  if (stats.hcp >= 33) estimate = Math.max(estimate, 12);
+  if (stats.hcp >= 37) estimate = Math.max(estimate, 13);
+  return Math.max(0, Math.min(13, Math.round(estimate)));
+}
+
+function bestContractForSide(deal, side) {
+  let best = { side, bid: "Pas", score: 0, tricks: 0 };
+  for (const strain of STRAINS) {
+    const tricks = estimateTricks(deal, side, strain);
+    const maxLevel = Math.max(0, Math.min(7, tricks - 6));
+    for (let level = 1; level <= maxLevel; level += 1) {
+      const bid = `${level}${strain}`;
+      const score = contractScoreMade(bid, sideVulnerable(side, deal.vulnerability));
+      if (score > best.score) best = { side, bid, score, tricks };
+    }
+  }
+  return best;
+}
+
+function indicativePar(deal) {
+  const ns = bestContractForSide(deal, "NZ");
+  const ow = bestContractForSide(deal, "OW");
+  if (ns.score >= ow.score) {
+    return { ...ns, nzScore: ns.score, label: ns.bid === "Pas" ? "Rondpas" : `NZ ${displayCall(ns.bid)}` };
+  }
+  return { ...ow, nzScore: -ow.score, label: `OW ${displayCall(ow.bid)}` };
+}
+
+function expectedFinalScore(deal, auction) {
+  const contract = lastContract(auction);
+  if (!contract) return { label: "Rondgepast", nzScore: 0, side: "NZ", made: true };
+  const declarer = declarerForFinalContract(auction);
+  const side = sideForSeat(declarer);
+  const [level, strain] = bidParts(contract.call);
+  const needed = level + 6;
+  const tricks = estimateTricks(deal, side, strain);
+  const vulnerable = sideVulnerable(side, deal.vulnerability);
+  if (tricks >= needed) {
+    const rawScore = contractScoreMade(contract.call, vulnerable);
+    return {
+      label: `${displayCall(contract.call)} door ${SEAT_NAMES[declarer]}, verwacht gemaakt`,
+      nzScore: scoreForNz(rawScore, side),
+      side,
+      made: true,
+    };
+  }
+  const down = needed - tricks;
+  const rawScore = -(down * (vulnerable ? 100 : 50));
+  return {
+    label: `${displayCall(contract.call)} door ${SEAT_NAMES[declarer]}, verwacht ${down} down`,
+    nzScore: scoreForNz(rawScore, side),
+    side,
+    made: false,
+  };
+}
+
+function nzFinalJudgement(deal, auction) {
+  const contract = lastContract(auction);
+  const par = indicativePar(deal);
+  const finalScore = expectedFinalScore(deal, auction);
+  if (!contract) return par.score === 0 ? "OK: rondpassen lijkt passend." : `Niet ideaal: indicatieve par is ${par.label}.`;
+  const declarer = declarerForFinalContract(auction);
+  if (sideForSeat(declarer) !== "NZ") return `NZ heeft niet het eindcontract; indicatieve par is ${par.label}.`;
+  if (finalScore.nzScore < -20) return "Niet OK: het NZ-contract lijkt te hoog.";
+  const gap = par.nzScore - finalScore.nzScore;
+  if (gap <= 30) return "OK: NZ zit dicht bij de indicatieve par.";
+  if (gap <= 140) return "Redelijk: NZ mist waarschijnlijk wat score.";
+  return "Niet ideaal: NZ blijft duidelijk onder de indicatieve par.";
+}
+
+function scoreInfo(session, pairState) {
+  if (!isAuctionComplete(pairState.auction)) return null;
+  const par = indicativePar(session.deal);
+  const final = expectedFinalScore(session.deal, pairState.auction);
+  return {
+    par,
+    final,
+    nzJudgement: nzFinalJudgement(session.deal, pairState.auction),
+    note: "Indicatief: berekend uit punten, fit en kwetsbaarheid. Echte par vereist double-dummy analyse.",
+  };
+}
+
+function normalizeSessionId(value) {
+  const clean = String(value || "").toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 24);
+  return clean.length >= 3 ? clean : "BRIDGE";
+}
+
+function normalizePair(value) {
+  const clean = String(value || "").trim().replace(/\s+/g, " ").slice(0, 40);
+  return clean || "Paar 1";
+}
+
+function normalizeSeat(value) {
+  return PARTNER_SEATS.includes(value) ? value : "N";
+}
+
+function makePairState(label) {
+  return { label, auction: [], chat: [], nextChatId: 1 };
+}
+
+function ensurePair(session, pairLabel) {
+  const pair = normalizePair(pairLabel);
+  session.pairs ||= {};
+  if (!session.pairs[pair]) session.pairs[pair] = makePairState(pair);
+  session.pairs[pair].label = pair;
+  return session.pairs[pair];
+}
+
+function resetPairsForNewBoard(session) {
+  const existingLabels = Object.keys(session.pairs || {});
+  session.pairs = {};
+  for (const label of existingLabels) {
+    session.pairs[label] = makePairState(label);
+  }
+}
+
+function initialSession(sessionId) {
+  const settings = defaultSettings();
+  return {
+    sessionId,
+    board: 1,
+    settings,
+    deal: createDeal(1, settings),
+    pairs: {},
+  };
+}
+
+async function ensureDb(env) {
+  if (!env.DB) return;
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS bied_state (id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)"
+  ).run();
+}
+
+async function loadSession(env, sessionId) {
+  const key = `${MAIN_SESSION_PREFIX}${sessionId}`;
+  if (!env.DB) {
+    if (!memoryStates.has(key)) memoryStates.set(key, initialSession(sessionId));
+    return clone(memoryStates.get(key));
+  }
+  await ensureDb(env);
+  const row = await env.DB.prepare("SELECT payload FROM bied_state WHERE id = ?").bind(key).first();
+  if (!row?.payload) return initialSession(sessionId);
+  try {
+    const parsed = JSON.parse(row.payload);
+    parsed.sessionId = sessionId;
+    parsed.settings = normalizeSettings(parsed.settings);
+    parsed.pairs ||= {};
+    return parsed;
+  } catch {
+    return initialSession(sessionId);
+  }
+}
+
+async function saveSession(env, session) {
+  const key = `${MAIN_SESSION_PREFIX}${session.sessionId}`;
+  if (!env.DB) {
+    memoryStates.set(key, clone(session));
+    return;
+  }
+  await ensureDb(env);
+  await env.DB.prepare(
+    "INSERT INTO bied_state (id, payload, updated_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at"
+  )
+    .bind(key, JSON.stringify(session), Date.now())
+    .run();
+}
+
+function currentResults(session) {
+  return Object.values(session.pairs || {}).map((pairState) => {
+    const complete = isAuctionComplete(pairState.auction);
+    const score = scoreInfo(session, pairState);
+    return {
+      pair: pairState.label,
+      complete,
+      calls: pairState.auction.length,
+      final: score?.final || null,
+      nzJudgement: score?.nzJudgement || null,
+    };
+  });
+}
+
+function publicState(session, pairLabel, seatValue) {
+  const pair = normalizePair(pairLabel);
+  const selectedSeat = normalizeSeat(seatValue);
+  const pairState = ensurePair(session, pair);
+  processAutoOpponents(session, pairState);
+  const complete = isAuctionComplete(pairState.auction);
+  return {
+    appVersion: APP_VERSION,
+    sessionId: session.sessionId,
+    pair,
+    pairs: Object.keys(session.pairs || {}),
+    board: session.board,
+    dealer: session.deal.dealer,
+    vulnerability: session.deal.vulnerability,
+    attempts: session.deal.attempts,
+    matchedFilters: session.deal.matchedFilters,
+    settings: session.settings,
+    auction: pairState.auction,
+    activeSeat: currentSeat(session.deal.dealer, pairState.auction),
+    complete,
+    selectedSeat,
+    myHand: session.deal.hands[selectedSeat],
+    myStats: handStats(session.deal.hands[selectedSeat]),
+    allHands: complete ? session.deal.hands : null,
+    allStats: complete ? Object.fromEntries(SEATS.map((seat) => [seat, handStats(session.deal.hands[seat])])) : null,
+    legalBids: allContractBids().filter((bid) => isHigherBid(bid, pairState.auction)),
+    chat: pairState.chat.slice(-80),
+    score: scoreInfo(session, pairState),
+    results: currentResults(session),
+  };
+}
+
+async function readBody(request) {
+  try {
+    return await request.json();
+  } catch {
+    return {};
+  }
+}
+
+function belgianTime() {
+  return new Intl.DateTimeFormat("nl-BE", {
+    timeZone: "Europe/Brussels",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date());
+}
+
+async function handleApi(request, env) {
+  const url = new URL(request.url);
+  const body = request.method === "POST" ? await readBody(request) : {};
+  const sessionId = normalizeSessionId(url.searchParams.get("session") || body.session);
+  const session = await loadSession(env, sessionId);
+  const pair = normalizePair(url.searchParams.get("pair") || body.pair);
+  const seat = normalizeSeat(url.searchParams.get("seat") || body.seat);
+
+  try {
+    if (request.method === "GET" && url.pathname === "/api/state") {
+      const before = JSON.stringify(session);
+      const data = publicState(session, pair, seat);
+      if (JSON.stringify(session) !== before) await saveSession(env, session);
+      return json(data);
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/new-deal") {
+      session.settings = normalizeSettings(body.settings || session.settings);
+      session.board += 1;
+      session.deal = createDeal(session.board, session.settings);
+      resetPairsForNewBoard(session);
+      ensurePair(session, pair);
+      const data = publicState(session, pair, seat);
+      await saveSession(env, session);
+      return json(data);
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/call") {
+      const pairState = ensurePair(session, pair);
+      processAutoOpponents(session, pairState);
+      const active = currentSeat(session.deal.dealer, pairState.auction);
+      const call = body.call;
+      if (seat !== active) {
+        const data = publicState(session, pair, seat);
+        await saveSession(env, session);
+        return json({ error: "Niet aan de beurt", ...data }, 409);
+      }
+      if (!PARTNER_SEATS.includes(seat)) {
+        const data = publicState(session, pair, seat);
+        await saveSession(env, session);
+        return json({ error: "Alleen Noord en Zuid bieden op de GSM.", ...data }, 403);
+      }
+      if (call !== "P" && (!allContractBids().includes(call) || !isHigherBid(call, pairState.auction))) {
+        const data = publicState(session, pair, seat);
+        await saveSession(env, session);
+        return json({ error: "Bod is niet geldig", ...data }, 400);
+      }
+      if (!isAuctionComplete(pairState.auction)) pairState.auction.push({ seat, call });
+      const data = publicState(session, pair, seat);
+      await saveSession(env, session);
+      return json(data);
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/chat") {
+      const pairState = ensurePair(session, pair);
+      const text = String(body.text || "").trim();
+      if (text) {
+        pairState.chat.push({
+          id: pairState.nextChatId,
+          seat,
+          text: text.slice(0, 500),
+          at: belgianTime(),
+        });
+        pairState.nextChatId += 1;
+      }
+      const data = publicState(session, pair, seat);
+      await saveSession(env, session);
+      return json(data);
+    }
+
+    return json({ error: "Onbekende actie" }, 404);
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+}
+
+const EMBEDDED_ASSETS = {
+  "/index.html": { body: "﻿<!doctype html>\r\n<html lang=\"nl\">\r\n<head>\r\n  <meta charset=\"utf-8\">\r\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\r\n  <meta name=\"theme-color\" content=\"#0e5b42\">\r\n  <meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\r\n  <meta name=\"apple-mobile-web-app-status-bar-style\" content=\"black-translucent\">\r\n  <meta name=\"apple-mobile-web-app-title\" content=\"Bridge Bieden\">\r\n  <link rel=\"manifest\" href=\"./manifest.webmanifest\">\r\n  <link rel=\"apple-touch-icon\" href=\"./apple-touch-icon.png\">\r\n  <title>Bridge Bied App</title>\r\n  <style>\r\n    :root{--background:#f4f7f2;--foreground:#18211d;--felt:#0e5b42;--felt-dark:#073b2d;--panel:#fff;--soft:#eef5ef;--line:#cbd8ce;--muted:#627168;--red:#b4233b;--black:#1c2521;--amber:#f1b94e;--blue:#2f6fa3}\r\n    *{box-sizing:border-box}body{margin:0;background:var(--background);color:var(--foreground);font-family:Arial,Helvetica,sans-serif}button,input,select{font:inherit}button{min-height:44px;border:0;border-radius:8px;font-weight:800;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}h1,h2,h3,p{margin-top:0}h1{margin-bottom:0;font-size:clamp(1.85rem,8vw,3.4rem);line-height:1;letter-spacing:0}h2{margin-bottom:0;font-size:1.35rem;line-height:1.15}h3{margin-bottom:8px;font-size:.95rem}\r\n    .shell{min-height:100svh;padding-bottom:max(20px,env(safe-area-inset-bottom))}.hero{background:linear-gradient(135deg,rgba(14,91,66,.98),rgba(7,59,45,.98));color:#fff;padding:max(18px,env(safe-area-inset-top)) 14px 18px}.hero-inner{display:grid;gap:14px;max-width:1120px;margin:0 auto}.eyebrow,.kicker{margin:0 0 5px;color:rgba(255,255,255,.76);font-size:.78rem;font-weight:800;text-transform:uppercase;letter-spacing:0}.kicker{color:var(--muted)}.top-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between}.seat-switch{display:flex;gap:8px}.seat-switch button,.ghost,.primary{padding:0 14px}.seat-switch button{border:1px solid rgba(255,255,255,.28);background:rgba(255,255,255,.1);color:#fff}.seat-switch button.active{background:#fff;color:var(--felt-dark)}.device-pill{display:flex;align-items:center;gap:8px;border:1px solid rgba(255,255,255,.28);border-radius:8px;background:rgba(255,255,255,.1);padding:7px 8px 7px 12px}.device-pill span{font-weight:850}.device-pill button{min-height:32px;border:1px solid rgba(255,255,255,.26);background:rgba(255,255,255,.12);color:#fff;padding:0 10px}.setup-card{max-width:640px;margin:18px auto 0;border:1px solid rgba(255,255,255,.22);border-radius:8px;background:rgba(255,255,255,.1);padding:16px}.setup-card p{color:rgba(255,255,255,.82);line-height:1.45}.setup-fields{display:grid;gap:10px;margin:14px 0}.setup-fields label{display:grid;gap:5px;color:rgba(255,255,255,.82);font-size:.86rem;font-weight:800}.link-box{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;border:1px solid rgba(255,255,255,.22);border-radius:8px;background:rgba(255,255,255,.1);padding:10px}.link-box strong{font-size:1.05rem}.setup-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.setup-actions button{background:#fff;color:var(--felt-dark);font-size:1.05rem}.primary{background:var(--amber);color:#211604}.ghost{border:1px solid rgba(255,255,255,.28);background:rgba(255,255,255,.1);color:#fff}.status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.status-card{border:1px solid rgba(255,255,255,.18);border-radius:8px;background:rgba(255,255,255,.1);padding:10px}.status-card span{display:block;color:rgba(255,255,255,.72);font-size:.78rem;font-weight:750}.status-card strong{display:block;margin-top:3px;font-size:.95rem}\r\n    .content{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(320px,.95fr);gap:14px;max-width:1120px;margin:0 auto;padding:14px}.panel{border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:14px;box-shadow:0 14px 34px rgba(24,33,29,.08)}.panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}.turn-pill{border:1px solid #c8ddcf;border-radius:8px;background:#e8f6ec;color:#165734;padding:8px 10px;font-size:.84rem;font-weight:850;text-align:right}.turn-pill.done{border-color:#d5c38c;background:#fff5d8;color:#6d4d00}\r\n    .hand-view{display:grid;gap:9px}.suit-line{display:grid;grid-template-columns:34px minmax(0,1fr);gap:8px;align-items:center}.suit-badge{display:grid;place-items:center;width:34px;height:34px;border-radius:8px;background:#f1f5f2;font-size:1.18rem;font-weight:900}.rank-row{display:flex;flex-wrap:wrap;gap:6px;min-height:34px}.rank-card{display:grid;place-items:center;min-width:34px;height:34px;border:1px solid #dae2dc;border-radius:6px;background:#fff;font-weight:850}.red{color:var(--red)}.black{color:var(--black)}.stats{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.stats span{border-radius:8px;background:var(--soft);color:var(--muted);padding:7px 9px;font-size:.86rem;font-weight:750}.stats strong{color:var(--foreground)}\r\n    .all-hands{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.shown-hand{border:1px solid var(--line);border-radius:8px;background:#fbfcfb;padding:10px}.shown-hand.partner{border-color:#b9d5c3;background:#f5fbf7}.shown-hand h3{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 9px}.shown-hand h3 span{color:var(--muted);font-size:.82rem}.shown-hand .hand-view{gap:5px}.shown-hand .suit-line{grid-template-columns:26px minmax(0,1fr);gap:6px}.shown-hand .suit-badge,.shown-hand .rank-card{width:26px;min-width:26px;height:26px;font-size:.86rem}.shown-hand .rank-row{gap:4px;min-height:26px}.shown-hand .stats{margin-top:8px;gap:5px}.shown-hand .stats span{padding:5px 7px;font-size:.78rem}\r\n    .bid-pad{display:grid;grid-template-columns:repeat(5,minmax(50px,1fr));gap:8px;max-height:340px;overflow:auto}.bid-pad button{border:1px solid var(--line);background:#fbfcfb;color:var(--foreground)}.bid-pad .pass{grid-column:1/-1;background:var(--blue);color:#fff}.bid-pad .red-bid{color:var(--red)}.notice{margin:10px 0 0;color:var(--muted);font-size:.9rem;line-height:1.35}\r\n    .auction-table{display:grid;grid-template-columns:repeat(4,minmax(62px,1fr));overflow:hidden;border:1px solid var(--line);border-radius:8px;background:#fbfcfb}.auction-head,.auction-cell{min-height:38px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);padding:7px}.auction-head:nth-child(4n),.auction-cell:nth-child(4n){border-right:0}.auction-head{background:#eef5ef;color:var(--muted);font-size:.86rem;font-weight:850}.auction-head.partner{background:#dff1e5;color:#165734}.auction-cell{display:flex;align-items:center;gap:6px}.auction-cell.partner{background:#f5fbf7}.auction-cell.empty-cell{background:#fbfcfb}.call{display:inline-grid;place-items:center;min-width:42px;min-height:30px;border-radius:6px;font-weight:850}.pass-call{background:#e9eeeb;color:#5e6d64}.contract-call{background:#0f654a;color:#fff}.empty{color:#9aa9a0}\r\n    .score-card{display:grid;gap:10px;border:1px solid #b9d5c3;border-radius:8px;background:#eff8f2;padding:12px}.score-card h3{margin:0;color:#165734}.score-line{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #d4e6da;padding-top:8px;color:var(--muted);font-size:.92rem}.score-line strong{color:var(--foreground);text-align:right}.score-note{margin:0;color:var(--muted);font-size:.82rem;line-height:1.35}.results-list{display:grid;gap:8px}.result-row{display:grid;grid-template-columns:minmax(92px,.8fr) minmax(0,1.35fr) minmax(0,1fr);gap:8px;align-items:start;border:1px solid var(--line);border-radius:8px;background:#fbfcfb;padding:9px}.result-row strong{font-size:.95rem}.result-row span{color:var(--muted);font-size:.86rem}.result-row.done{border-color:#b9d5c3;background:#f5fbf7}\r\n    .settings{display:grid;gap:10px}.settings-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.settings label{display:grid;gap:5px;color:var(--muted);font-size:.84rem;font-weight:800}select,input{width:100%;min-height:40px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--foreground);padding:0 9px}.filter-grid{display:grid;grid-template-columns:minmax(92px,1fr) repeat(5,minmax(52px,.75fr));gap:7px;overflow-x:auto}.filter-row{display:contents}.filter-head,.filter-row strong{display:flex;align-items:center;min-height:34px;color:var(--muted);font-size:.8rem;font-weight:850}.filter-grid input{text-align:center;min-width:52px}\r\n    .chat-log{display:grid;gap:8px;max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:#fbfcfb;padding:10px}.chat-msg{display:grid;gap:2px}.chat-msg.mine{text-align:right}.chat-msg span{color:var(--muted);font-size:.75rem;font-weight:750}.chat-msg p{display:inline-block;margin:0;border-radius:8px;background:var(--soft);padding:8px 10px;line-height:1.35}.chat-msg.mine p{background:#dff1e5}.chat-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;margin-top:10px}.error{margin:0 0 10px;border:1px solid #f0c3c3;border-radius:8px;background:#fff2f2;color:#8b1e1e;padding:9px 10px;font-weight:750}\r\n    @media (max-width:860px){.content{grid-template-columns:1fr}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.settings-row{grid-template-columns:1fr}}@media (max-width:520px){.content{padding:10px}.hero{padding-left:10px;padding-right:10px}.top-actions{align-items:stretch}.seat-switch,.top-actions .primary,.device-pill{width:100%}.seat-switch button{flex:1}.setup-actions{grid-template-columns:1fr}.bid-pad{grid-template-columns:repeat(4,minmax(50px,1fr))}.auction-head,.auction-cell{padding:6px}.call{min-width:38px}.all-hands{grid-template-columns:1fr}}\r\n  </style>\r\n</head>\r\n<body>\r\n  <main class=\"shell\" id=\"app\"></main>\r\n  <script>\r\n    const seats = [\"N\", \"E\", \"S\", \"W\"];\r\n    const partnerSeats = [\"N\", \"S\"];\r\n    const suits = [\"S\", \"H\", \"D\", \"C\"];\r\n    const suitMeta = {\r\n      S: { label: \"Schoppen\", short: \"S\", symbol: \"â™ \", cls: \"black\" },\r\n      H: { label: \"Harten\", short: \"H\", symbol: \"â™¥\", cls: \"red\" },\r\n      D: { label: \"Ruiten\", short: \"R\", symbol: \"â™¦\", cls: \"red\" },\r\n      C: { label: \"Klaveren\", short: \"K\", symbol: \"â™£\", cls: \"black\" }\r\n    };\r\n    const seatNames = { N: \"Noord\", E: \"Oost\", S: \"Zuid\", W: \"West\" };\r\n    const filterTargets = [\"N\", \"S\", \"E\", \"W\", \"NZ\"];\r\n    const filterTargetNames = { N: \"Noord\", S: \"Zuid\", E: \"Oost\", W: \"West\", NZ: \"NZ samen\" };\r\n    function cleanSession(value) {\r\n      const clean = String(value || \"\").toUpperCase().replace(/[^A-Z0-9-]/g, \"\").slice(0, 24);\r\n      return clean.length >= 3 ? clean : \"\";\r\n    }\r\n    function newSessionCode() {\r\n      const chars = \"ABCDEFGHJKLMNPQRSTUVWXYZ23456789\";\r\n      let code = \"\";\r\n      for (let index = 0; index < 6; index += 1) code += chars[Math.floor(Math.random() * chars.length)];\r\n      return code;\r\n    }\r\n    function initialSession() {\r\n      const params = new URLSearchParams(location.search);\r\n      const fromUrl = cleanSession(params.get(\"tafel\"));\r\n      const fromStorage = cleanSession(localStorage.getItem(\"biedapp-last-session\"));\r\n      const session = fromUrl || fromStorage || newSessionCode();\r\n      localStorage.setItem(\"biedapp-last-session\", session);\r\n      if (params.get(\"tafel\") !== session) {\r\n        params.set(\"tafel\", session);\r\n        history.replaceState(null, \"\", `${location.pathname}?${params.toString()}${location.hash}`);\r\n      }\r\n      return session;\r\n    }\r\n    function storageKey(name, session) {\r\n      return `biedapp-${name}-${session}`;\r\n    }\r\n    function normalizePairName(value) {\r\n      return String(value || \"\").trim().replace(/\\s+/g, \" \").slice(0, 40) || \"Paar 1\";\r\n    }\r\n    const sessionId = initialSession();\r\n    const state = {\r\n      session: sessionId,\r\n      pair: localStorage.getItem(storageKey(\"pair\", sessionId)) || \"\",\r\n      seat: localStorage.getItem(storageKey(\"seat\", sessionId)) || \"\",\r\n      data: null,\r\n      draftSettings: null,\r\n      draftBoard: null,\r\n      error: \"\",\r\n      busy: false\r\n    };\r\n\r\n    function displayCall(call) {\r\n      if (call === \"P\") return \"Pas\";\r\n      const level = call.slice(0, 1);\r\n      const strain = call.slice(1);\r\n      return strain === \"NT\" ? `${level}SA` : `${level}${suitMeta[strain].symbol}`;\r\n    }\r\n    function formatNzScore(score) {\r\n      if (score > 0) return `+${score} NZ`;\r\n      if (score < 0) return `${score} NZ`;\r\n      return \"0\";\r\n    }\r\n    function htmlEscape(text) {\r\n      return String(text).replace(/[&<>\"']/g, (ch) => ({ \"&\": \"&amp;\", \"<\": \"&lt;\", \">\": \"&gt;\", '\"': \"&quot;\", \"'\": \"&#39;\" }[ch]));\r\n    }\r\n    function activePair() {\r\n      return normalizePairName(state.pair || \"Paar 1\");\r\n    }\r\n    function apiPath(path) {\r\n      const params = new URLSearchParams({ session: state.session, pair: activePair(), seat: state.seat || \"N\" });\r\n      return `${path}?${params.toString()}`;\r\n    }\r\n    function apiBody(extra = {}) {\r\n      return JSON.stringify({ session: state.session, pair: activePair(), seat: state.seat || \"N\", ...extra });\r\n    }\r\n    function shareUrl() {\r\n      const url = new URL(location.href);\r\n      url.pathname = url.pathname.endsWith(\"/\") ? `${url.pathname}index.html` : url.pathname;\r\n      url.searchParams.set(\"tafel\", state.session);\r\n      return url.toString();\r\n    }\r\n    async function shareSession() {\r\n      const url = shareUrl();\r\n      try {\r\n        if (navigator.share) {\r\n          await navigator.share({ title: \"Bridge Bied App\", text: `Bridge sessie ${state.session}`, url });\r\n        } else if (navigator.clipboard) {\r\n          await navigator.clipboard.writeText(url);\r\n          state.error = \"Link gekopieerd. Stuur die via WhatsApp, SMS of mail.\";\r\n          render();\r\n        }\r\n      } catch {\r\n        state.error = url;\r\n        render();\r\n      }\r\n    }\r\n    async function api(path, options = {}) {\r\n      const response = await fetch(apiPath(path), {\r\n        ...options,\r\n        headers: { \"Content-Type\": \"application/json\", ...(options.headers || {}) }\r\n      });\r\n      const data = await response.json();\r\n      if (!response.ok && data.error) state.error = data.error;\r\n      else state.error = \"\";\r\n      state.data = data;\r\n      render();\r\n      return data;\r\n    }\r\n    async function refresh() {\r\n      if (state.busy) return;\r\n      try {\r\n        const response = await fetch(apiPath(\"/api/state\"), { cache: \"no-store\" });\r\n        state.data = await response.json();\r\n        render();\r\n      } catch {\r\n        state.error = \"Geen verbinding met de biedserver.\";\r\n        render();\r\n      }\r\n    }\r\n    function handHtml(hand) {\r\n      return `<div class=\"hand-view\">${suits.map((suit) => `<div class=\"suit-line\"><span class=\"suit-badge ${suitMeta[suit].cls}\">${suitMeta[suit].symbol}</span><div class=\"rank-row\">${hand.filter((card) => card.suit === suit).map((card) => `<span class=\"rank-card ${suitMeta[suit].cls}\">${card.rank}</span>`).join(\"\")}</div></div>`).join(\"\")}</div>`;\r\n    }\r\n    function statsHtml(stats) {\r\n      return `<div class=\"stats\"><span><strong>${stats.hcp}</strong> punten</span><span><strong>${stats.shape}</strong> verdeling</span><span>${stats.balanced ? \"Gebalanceerd\" : \"Ongebalanceerd\"}</span></div>`;\r\n    }\r\n    function allHandsGridHtml(data) {\r\n      if (!data.complete) return \"\";\r\n      if (!data.allHands) {\r\n        return `<p class=\"notice\">De pagina is vernieuwd, maar de biedserver draait nog op de oude versie. Stop het zwarte servervenster en start <strong>start_biedapp.bat</strong> opnieuw.</p>`;\r\n      }\r\n      return `<div class=\"all-hands\">${seats.map((seat) => `<div class=\"shown-hand ${partnerSeats.includes(seat) ? \"partner\" : \"\"}\"><h3>${seatNames[seat]} <span>${data.allStats[seat].hcp} pntn</span></h3>${handHtml(data.allHands[seat])}${statsHtml(data.allStats[seat])}</div>`).join(\"\")}</div>`;\r\n    }\r\n    function auctionRoundRows(auction, dealer) {\r\n      const rows = [];\r\n      const dealerIndex = seats.indexOf(dealer);\r\n      auction.forEach((entry, index) => {\r\n        const rowIndex = Math.floor((dealerIndex + index) / seats.length);\r\n        if (!rows[rowIndex]) rows[rowIndex] = { N: null, E: null, S: null, W: null };\r\n        rows[rowIndex][entry.seat] = entry.call;\r\n      });\r\n      return rows.length ? rows : [{ N: null, E: null, S: null, W: null }];\r\n    }\r\n    function auctionTableHtml(auction, dealer) {\r\n      const rounds = auctionRoundRows(auction, dealer);\r\n      return `<div class=\"auction-table\">${seats.map((seat) => `<div class=\"auction-head ${partnerSeats.includes(seat) ? \"partner\" : \"\"}\">${seatNames[seat]}</div>`).join(\"\")}${rounds.map((round) => seats.map((seat) => {\r\n        const call = round[seat];\r\n        return `<div class=\"auction-cell ${partnerSeats.includes(seat) ? \"partner\" : \"\"} ${call ? \"\" : \"empty-cell\"}\">${call ? `<span class=\"call ${call === \"P\" ? \"pass-call\" : \"contract-call\"}\">${displayCall(call)}</span>` : `<span class=\"empty\">Â·</span>`}</div>`;\r\n      }).join(\"\")).join(\"\")}</div>`;\r\n    }\r\n    function settingsHtml(settings) {\r\n      return `<div class=\"settings\">\r\n        <div class=\"settings-row\">\r\n          <label>Dealer<select data-setting=\"dealerMode\"><option value=\"cycle\"${settings.dealerMode === \"cycle\" ? \" selected\" : \"\"}>Boardvolgorde</option><option value=\"random\"${settings.dealerMode === \"random\" ? \" selected\" : \"\"}>Random</option>${seats.map((seat) => `<option value=\"${seat}\"${settings.dealerMode === seat ? \" selected\" : \"\"}>${seatNames[seat]}</option>`).join(\"\")}</select></label>\r\n          <label>OW<select data-setting=\"opponentMode\"><option value=\"pass\"${settings.opponentMode === \"pass\" ? \" selected\" : \"\"}>Past automatisch</option><option value=\"auto\"${settings.opponentMode === \"auto\" ? \" selected\" : \"\"}>Biedt simpel mee</option></select></label>\r\n        </div>\r\n        <div class=\"filter-grid\">\r\n          <div class=\"filter-head\">Hand</div><div class=\"filter-head\">Min pntn</div>${suits.map((suit) => `<div class=\"filter-head\">${suitMeta[suit].short}</div>`).join(\"\")}\r\n          ${filterTargets.map((target) => `<div class=\"filter-row\"><strong>${filterTargetNames[target]}</strong><input data-hcp=\"${target}\" type=\"number\" min=\"0\" max=\"${target === \"NZ\" ? 40 : 37}\" value=\"${settings.filters[target].minHcp}\">${suits.map((suit) => `<input data-suit=\"${target}:${suit}\" type=\"number\" min=\"0\" max=\"${target === \"NZ\" ? 26 : 13}\" value=\"${settings.filters[target].minSuitLengths[suit]}\">`).join(\"\")}</div>`).join(\"\")}\r\n        </div>\r\n      </div>`;\r\n    }\r\n    function scoreHtml(score) {\r\n      if (!score) return \"\";\r\n      return `<div class=\"score-card\"><h3>Score na bieding</h3><div class=\"score-line\"><span>Par score</span><strong>${score.par.label} Â· ${formatNzScore(score.par.nzScore)}</strong></div><div class=\"score-line\"><span>Eindcontract</span><strong>${score.final.label} Â· ${formatNzScore(score.final.nzScore)}</strong></div><div class=\"score-line\"><span>Eindbod NZ</span><strong>${score.nzJudgement}</strong></div><p class=\"score-note\">${score.note}</p></div>`;\r\n    }\r\n    function resultsHtml(results) {\r\n      const rows = (results || []).slice().sort((left, right) => left.pair.localeCompare(right.pair));\r\n      if (!rows.length) return `<p class=\"notice\">Nog geen paren in deze sessie.</p>`;\r\n      return `<div class=\"results-list\">${rows.map((row) => `<div class=\"result-row ${row.complete ? \"done\" : \"\"}\"><strong>${htmlEscape(row.pair)}</strong><span>${row.complete && row.final ? `${htmlEscape(row.final.label)} Â· ${formatNzScore(row.final.nzScore)}` : `${row.calls || 0} biedingen`}</span><span>${row.complete ? htmlEscape(row.nzJudgement || \"\") : \"Nog bezig\"}</span></div>`).join(\"\")}</div>`;\r\n    }\r\n    function chatHtml(chat) {\r\n      return `<div class=\"chat-log\">${chat.length ? chat.map((msg) => `<div class=\"chat-msg ${msg.seat === state.seat ? \"mine\" : \"\"}\"><span>${seatNames[msg.seat]} Â· ${msg.at}</span><p>${htmlEscape(msg.text)}</p></div>`).join(\"\") : `<p class=\"notice\">Nog geen chatberichten.</p>`}</div><form class=\"chat-form\" data-chat-form><input name=\"text\" autocomplete=\"off\" placeholder=\"Bericht aan partner\"><button class=\"primary\" type=\"submit\">Stuur</button></form>`;\r\n    }\r\n    function cloneSettings(settings) {\r\n      return JSON.parse(JSON.stringify(settings));\r\n    }\r\n    function savedDraftKey(board) {\r\n      return `biedapp-settings-draft-${state.session}-${board}`;\r\n    }\r\n    function settingsDraft(data) {\r\n      if (!state.draftSettings || state.draftBoard !== data.board) {\r\n        const saved = localStorage.getItem(savedDraftKey(data.board));\r\n        try {\r\n          state.draftSettings = saved ? JSON.parse(saved) : cloneSettings(data.settings);\r\n        } catch {\r\n          state.draftSettings = cloneSettings(data.settings);\r\n        }\r\n        state.draftBoard = data.board;\r\n      }\r\n      return state.draftSettings;\r\n    }\r\n    function saveDraftSettings() {\r\n      if (state.draftSettings && state.draftBoard) {\r\n        localStorage.setItem(savedDraftKey(state.draftBoard), JSON.stringify(state.draftSettings));\r\n      }\r\n    }\r\n    function setupHtml(data) {\r\n      const pairValue = htmlEscape(state.pair || \"Paar 1\");\r\n      const knownPairs = data && data.pairs && data.pairs.length ? `<p class=\"notice\">Paren in deze sessie: ${data.pairs.map(htmlEscape).join(\", \")}</p>` : \"\";\r\n      return `<section class=\"hero\"><div class=\"hero-inner\"><div><p class=\"eyebrow\">Bridge bied app</p><h1>Deze GSM instellen</h1></div><div class=\"setup-card\"><div class=\"link-box\"><strong>Sessie ${htmlEscape(state.session)}</strong><button class=\"ghost\" data-share-link type=\"button\">Deel link</button></div><p>Stuur deze link naar je partner. Andere paren gebruiken dezelfde link, maar kiezen een eigen paarnaam, bijvoorbeeld Paar 2.</p><div class=\"setup-fields\"><label>Paarnaam<input data-pair-input value=\"${pairValue}\" placeholder=\"Paar 1\"></label></div><div class=\"setup-actions\"><button data-setup-seat=\"N\" type=\"button\">Deze GSM is Noord</button><button data-setup-seat=\"S\" type=\"button\">Deze GSM is Zuid</button></div>${knownPairs}${data ? `<p class=\"notice\">Verbonden met board ${data.board}. De keuze wordt op deze GSM onthouden.</p>` : \"\"}</div></div></section>`;\r\n    }\r\n    function render() {\r\n      const data = state.data;\r\n      if (!data) {\r\n        document.getElementById(\"app\").innerHTML = `<section class=\"hero\"><div class=\"hero-inner\"><p class=\"eyebrow\">Bridge bied app</p><h1>Verbinden...</h1></div></section>`;\r\n        return;\r\n      }\r\n      if (!state.seat || !state.pair) {\r\n        document.getElementById(\"app\").innerHTML = setupHtml(data);\r\n        return;\r\n      }\r\n      const auctionTable = auctionTableHtml(data.auction, data.dealer);\r\n      const myTurn = data.activeSeat === state.seat && !data.complete;\r\n      const results = data.results || [];\r\n      document.getElementById(\"app\").innerHTML = `\r\n        <section class=\"hero\">\r\n          <div class=\"hero-inner\">\r\n            <div class=\"top-actions\">\r\n              <div><p class=\"eyebrow\">Bridge bied app</p><h1>Noord/Zuid samen bieden</h1></div>\r\n              <div class=\"device-pill\"><span>${htmlEscape(data.pair)} Â· ${seatNames[state.seat]}</span><button data-share-link type=\"button\">Deel</button><button data-reset-seat type=\"button\">Wijzig</button></div>\r\n            </div>\r\n            <div class=\"status-grid\">\r\n              <div class=\"status-card\"><span>Board</span><strong>${data.board}</strong></div>\r\n              <div class=\"status-card\"><span>Gever</span><strong>${seatNames[data.dealer]}</strong></div>\r\n              <div class=\"status-card\"><span>Kwets</span><strong>${data.vulnerability}</strong></div>\r\n              <div class=\"status-card\"><span>Sessie</span><strong>${htmlEscape(data.sessionId || state.session)} Â· ${results.length} paar${results.length === 1 ? \"\" : \"en\"}</strong></div>\r\n            </div>\r\n          </div>\r\n        </section>\r\n        <section class=\"content\">\r\n          <div class=\"panel\">\r\n            ${state.error ? `<p class=\"error\">${htmlEscape(state.error)}</p>` : \"\"}\r\n            <div class=\"panel-head\"><div><p class=\"kicker\">${data.complete ? \"Open handen\" : \"Jouw hand\"}</p><h2>${data.complete ? \"Alle vier handen\" : seatNames[state.seat]}</h2></div><div class=\"turn-pill ${data.complete ? \"done\" : \"\"}\">${data.complete ? \"Klaar\" : myTurn ? \"Jij biedt\" : `Wacht op ${seatNames[data.activeSeat]}`}</div></div>\r\n            ${data.complete ? allHandsGridHtml(data) : `${handHtml(data.myHand)}${statsHtml(data.myStats)}`}\r\n          </div>\r\n          <div class=\"panel\">\r\n            <div class=\"panel-head\"><div><p class=\"kicker\">Bieden</p><h2>${myTurn ? \"Kies je bod\" : data.complete ? \"Bieding klaar\" : \"Nog niet aan de beurt\"}</h2></div></div>\r\n            ${scoreHtml(data.score)}\r\n            <div class=\"bid-pad\"><button class=\"pass\" data-call=\"P\" ${myTurn ? \"\" : \"disabled\"} type=\"button\">Pas</button>${data.legalBids.map((bid) => `<button class=\"${bid.endsWith(\"H\") || bid.endsWith(\"D\") ? \"red-bid\" : \"\"}\" data-call=\"${bid}\" ${myTurn ? \"\" : \"disabled\"} type=\"button\">${displayCall(bid)}</button>`).join(\"\")}</div>\r\n            <p class=\"notice\">Er is geen biedadvies zichtbaar. Noord en Zuid beslissen zelf.</p>\r\n          </div>\r\n          <div class=\"panel\">\r\n            <div class=\"panel-head\"><div><p class=\"kicker\">Biedverloop</p><h2>Vanaf ${seatNames[data.dealer]}</h2></div></div>\r\n            ${auctionTable}\r\n          </div>\r\n          <div class=\"panel\">\r\n            <div class=\"panel-head\"><div><p class=\"kicker\">Vergelijken</p><h2>Resultaten paren</h2></div></div>\r\n            ${resultsHtml(results)}\r\n          </div>\r\n          <div class=\"panel\">\r\n            <div class=\"panel-head\"><div><p class=\"kicker\">Nieuwe bieding</p><h2>Instellingen</h2></div><button class=\"primary\" data-new-deal type=\"button\">Nieuwe random hand</button></div>\r\n            <p class=\"notice\">${data.matchedFilters ? `Laatste deal gevonden in ${data.attempts} poging${data.attempts === 1 ? \"\" : \"en\"}.` : `Geen match binnen ${data.attempts} pogingen; filter is te streng.`}</p>\r\n            ${settingsHtml(settingsDraft(data))}\r\n          </div>\r\n          <div class=\"panel\">\r\n            <div class=\"panel-head\"><div><p class=\"kicker\">Chat</p><h2>Overleg</h2></div></div>\r\n            ${chatHtml(data.chat)}\r\n          </div>\r\n        </section>`;\r\n    }\r\n    document.addEventListener(\"click\", async (event) => {\r\n      const button = event.target.closest(\"button\");\r\n      if (!button) return;\r\n      if (button.dataset.setupSeat) {\r\n        const pairInput = document.querySelector(\"[data-pair-input]\");\r\n        state.pair = normalizePairName(pairInput ? pairInput.value : state.pair);\r\n        state.seat = button.dataset.setupSeat;\r\n        localStorage.setItem(storageKey(\"pair\", state.session), state.pair);\r\n        localStorage.setItem(storageKey(\"seat\", state.session), state.seat);\r\n        refresh();\r\n      }\r\n      if (button.dataset.resetSeat !== undefined) {\r\n        localStorage.removeItem(storageKey(\"pair\", state.session));\r\n        localStorage.removeItem(storageKey(\"seat\", state.session));\r\n        state.pair = \"\";\r\n        state.seat = \"\";\r\n        render();\r\n      }\r\n      if (button.dataset.shareLink !== undefined) {\r\n        await shareSession();\r\n      }\r\n      if (button.dataset.call) {\r\n        state.busy = true;\r\n        await api(\"/api/call\", { method: \"POST\", body: apiBody({ call: button.dataset.call }) });\r\n        state.busy = false;\r\n      }\r\n      if (button.dataset.newDeal !== undefined) {\r\n        state.busy = true;\r\n        await api(\"/api/new-deal\", { method: \"POST\", body: apiBody({ settings: state.draftSettings || state.data.settings }) });\r\n        if (state.draftBoard) localStorage.removeItem(savedDraftKey(state.draftBoard));\r\n        state.draftSettings = null;\r\n        state.draftBoard = null;\r\n        state.busy = false;\r\n      }\r\n    });\r\n    function updateSettingFromElement(el) {\r\n      if (!state.data) return;\r\n      const settings = settingsDraft(state.data);\r\n      if (el.dataset.setting === \"dealerMode\") settings.dealerMode = el.value;\r\n      if (el.dataset.setting === \"opponentMode\") settings.opponentMode = el.value;\r\n      if (el.dataset.hcp) settings.filters[el.dataset.hcp].minHcp = Number(el.value || 0);\r\n      if (el.dataset.suit) {\r\n        const [target, suit] = el.dataset.suit.split(\":\");\r\n        settings.filters[target].minSuitLengths[suit] = Number(el.value || 0);\r\n      }\r\n      saveDraftSettings();\r\n    }\r\n    document.addEventListener(\"change\", (event) => {\r\n      const el = event.target;\r\n      if (el.dataset.setting || el.dataset.hcp || el.dataset.suit) updateSettingFromElement(el);\r\n    });\r\n    document.addEventListener(\"input\", (event) => {\r\n      const el = event.target;\r\n      if (el.dataset.hcp || el.dataset.suit) updateSettingFromElement(el);\r\n    });\r\n    document.addEventListener(\"submit\", async (event) => {\r\n      const form = event.target.closest(\"[data-chat-form]\");\r\n      if (!form) return;\r\n      event.preventDefault();\r\n      const input = form.elements.text;\r\n      const text = input.value.trim();\r\n      input.value = \"\";\r\n      if (text) await api(\"/api/chat\", { method: \"POST\", body: apiBody({ text }) });\r\n    });\r\n    refresh();\r\n    setInterval(refresh, 4000);\r\n    if (\"serviceWorker\" in navigator && location.protocol !== \"file:\") {\r\n      navigator.serviceWorker.register(\"./sw.js\").catch(() => undefined);\r\n    }\r\n  </script>\r\n</body>\r\n</html>\r\n", type: "text/html; charset=utf-8" },
+  "/manifest.webmanifest": { body: "{\n  \"name\": \"Bridge Bied App\",\n  \"short_name\": \"Bridge Bieden\",\n  \"description\": \"Noord/Zuid bridge biedtrainer met random handen, filters, par-info en chat.\",\n  \"lang\": \"nl\",\n  \"start_url\": \"/index.html\",\n  \"scope\": \"/\",\n  \"display\": \"standalone\",\n  \"orientation\": \"portrait-primary\",\n  \"background_color\": \"#f4f7f2\",\n  \"theme_color\": \"#0e5b42\",\n  \"icons\": [\n    {\n      \"src\": \"/icon-192.png\",\n      \"sizes\": \"192x192\",\n      \"type\": \"image/png\",\n      \"purpose\": \"any maskable\"\n    },\n    {\n      \"src\": \"/icon-512.png\",\n      \"sizes\": \"512x512\",\n      \"type\": \"image/png\",\n      \"purpose\": \"any maskable\"\n    }\n  ]\n}\n", type: "application/manifest+json; charset=utf-8" },
+  "/sw.js": { body: "const CACHE_NAME = \"bridge-bied-app-v2\";\nconst APP_SHELL = [\"/index.html\", \"/manifest.webmanifest\", \"/icon-192.png\", \"/icon-512.png\", \"/apple-touch-icon.png\"];\n\nself.addEventListener(\"install\", (event) => {\n  event.waitUntil(\n    caches\n      .open(CACHE_NAME)\n      .then((cache) => cache.addAll(APP_SHELL))\n      .catch(() => undefined),\n  );\n  self.skipWaiting();\n});\n\nself.addEventListener(\"activate\", (event) => {\n  event.waitUntil(\n    caches\n      .keys()\n      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key)))),\n  );\n  self.clients.claim();\n});\n\nself.addEventListener(\"fetch\", (event) => {\n  if (event.request.method !== \"GET\") {\n    return;\n  }\n\n  const url = new URL(event.request.url);\n\n  if (url.origin !== self.location.origin) {\n    return;\n  }\n\n  if (url.pathname.startsWith(\"/api/\")) {\n    event.respondWith(fetch(event.request));\n    return;\n  }\n\n  event.respondWith(\n    fetch(event.request)\n      .then((response) => {\n        const copy = response.clone();\n        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy)).catch(() => undefined);\n        return response;\n      })\n      .catch(() => caches.match(event.request).then((cached) => cached || caches.match(\"/index.html\"))),\n  );\n});\n", type: "text/javascript; charset=utf-8" },
+  "/favicon.svg": { body: "<svg width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\r\n<path d=\"M22 19.2727C22 20.779 20.779 22 19.2727 22H14.7273C13.221 22 12 20.779 12 19.2727V12H19.2727C20.779 12 22 13.221 22 14.7273V19.2727Z\" fill=\"#68C4FF\"/>\r\n<path d=\"M20 2C21.1046 2 22 2.89543 22 4V7C22 8.10457 21.1046 9 20 9H17C15.8954 9 15 8.10457 15 7V4C15 2.89543 15.8954 2 17 2H20Z\" fill=\"#0C79D8\"/>\r\n<path d=\"M7 15C8.10457 15 9 15.8954 9 17V20C9 21.1046 8.10457 22 7 22H4C2.89543 22 2 21.1046 2 20V17C2 15.8954 2.89543 15 4 15H7Z\" fill=\"#0C79D8\"/>\r\n<path d=\"M12 12H4.72727C3.22104 12 2 10.779 2 9.27273V4.72727C2 3.22104 3.22104 2 4.72727 2H9.27273C10.779 2 12 3.22104 12 4.72727V12Z\" fill=\"#2E9EFF\"/>\r\n</svg>\r\n", type: "image/svg+xml; charset=utf-8" },
+  "/icon-192.png": { base64: "iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAYAAABS3GwHAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAbNSURBVHhe7du/bxRHGIdxuhRB+QtCkSCX6SOZym2kCPGjSoFESUMJEqSjJnVcuKCjd2MkWwjRUdBZWC4o6CiQckZyOdEaG9/N7t7Mfvdud+d9n+LTJHs7Fvc+3tm985Wf/toKgFdX4v8AeEIAcI0A4BoBwDUCgGsEANcIAK4RAFwjALhGAHCNAOAaAcA1AoBrBADXCACuEQBcIwC4RgBwbaUBXL19I/z4x+/AWlVzFs+eaqUBVD/cD5u/AWtVzVk8eyoCQHEIAK4RAFwjALhGAHCNAOAaAcA1AoBrBADXCACuEQBcIwC4RgBwjQDgmosAth7cC3//+w8MqN7L+P3tw0UA1T/c19MZDKjey/j97YMAUBQCEBCAHQQgIAA7CEBAAHYQgIAA7CAAAQHYQQACArCDAATTD+A4nLz9M/y3tz6zo+OGdctDAAICWDT7FK9fDgIQEECT5+Gk9nNMHwEICKBNeREQgIAAlnj7sqgICEBAAMuVdINMAAICSClnK0QAAhMBvH/T8LqUjPOeK+UqQAACvwGc+/S8fr5Yn/MPiAAE7gM4nYWT9w3nnFfIzTABCAgg5ypQxn0AAQgIYBa+fnkZZvE553EF6I0AZASQiwAEBJDeAvEUqD8CkK07gNT5H4aTL/FrpokABN4DODl6WD/fvEK2PxUCELgNILXvP1POb/8KAQhMBLAmpez9LxCAgACalTb8FQIQEECsjA+9mhCAgAAaKPcUE0AAAgJoV9o2iAAEBJDAY9CVIADZyAFUComAAAQmAhD37MkPweaUsB0iAIHnAC7khTD9p0MEICCAb3IimPpVgAAEBHDhTfqrEStZZ30IQEAAHdaZ+M0wAQgI4FLyb4Mnfh9AAAICuEQAiwhgEoYKIOMegC2QjABkAwWQ+LPIla2zRgQgIIDM4ecxaC8EIFtnABnbnu+m/9dhBCAwEcAQ5MiGQwACAsgx/d/+FQIQEEDa1Pf+FwhAQADLlTL8FQIQEEC7koa/QgACAmgw8Q+82hCAgADOFTr08whAMP0AkIsABARgBwEICMAOAhAQgB0EICAAOwhAQAB2EICAAOwgAAEB2EEAAgKwgwAEBGAHAQgIwA4CEBCAHQQgIAA7CEBAAHYQgIAA7CAAAQHYQQCCIgI43g43N34NP2/8UnNz57B+fJa98GjunMvO82Hn1vfjrm08Dq8ajpkCAhBMO4DDsH23efDnXdu4FbaP49emEEAKAYwqb/j1wSSAFAIYU7TtufZ0r3bMq6eLgSwb4joCSCGAEeUN3eJVoimSdgSQQgBj2n+88Nu923DnIIAUAhhTy5Of1Q0gAaQQwMjiPX6s31VhMYBcBKAhAFEqAn0oCSCFACYj75Hoo/34dcsQQAoBTNT8nlwfTu4BUgigAPEWKf8qQAApBDCa/OHsdqz2OgLojwA6iT7gWjZ00eNSrgD191hFACOK9/mNgxd/XaLTl+IIIIUARpX35Gdet88FCCCFAEaXH0G34a8QQAoBTEXL1yLOBvLudvgQH5+FAFIIAEUhAAEB2EEAAgKwgwAEBGAHAQgIwA4CEEwzgIPw7vpm2M315KDhHCmLa7zeOWo45puPT+I174fD7A/chkMAAhMBSEOZF8Dnnfs91xkOAQjsBLAZdu+8CJ9r52qTDqCk4a8QgKCEAJqGs+m4yrvsL8Ml1th/Vgss/9zjIABB2QHUB3XpsblrHL8Irwsb/goBCKwFkD+oLWsUOvwVAhCUHUC8BeqyR29aIz7fsrWnhwAEJQSQrdPj0DiAg3B4Jzpfp5vq8RGAwEwAnYY/fw2uAPX5UxBAJ3nDuXv9WfhYe22u3DW4B1gFAugk3p5c/hauP5tXI2gJoLqS1B6BqmsMiwAEpQVQqX81QRnQhgDmtlG1NTpvsYZHAIISA4j/vzag0TlqN7z1Naa+FSIAQZkB1J//dx/Q9Bqr224NgwAExQZwetTzsaW4RucrzXAIQFBuAM2f2rYeW6Ov0e1KMxwCEBQdQK9tSv4atRvi7DWGRQCC0gPQtyld1qjfEOetMSwCEEwzACgIQEAAdhCAgADsIAABAdhBAAICsIMABARgBwEICMAOAhAQgB0EICAAOwhAQAB2EICAAOwgAAEB2EEAAgKwgwAEBGAHAQgIwA4CEGw9uHf2D4fyVe9l/P724SIAoA0BwDUCgGsEANcIAK4RAFwjALhGAHCNAOAaAcA1AoBrBADXCACuEQBcm2wAV2/fOPvhgHWq5iyePdVKAwBKQwBwjQDgGgHANQKAawQA1wgArhEAXCMAuEYAcI0A4BoBwDUCgGsEANcIAK4RAFwjALhGAHDtf8AOybbM69EnAAAAAElFTkSuQmCC", type: "image/png" },
+  "/icon-512.png": { base64: "iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0eNT6AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAABs7SURBVHhe7d0/j2xZdcZhMgdG/gSewLYmdG4JIlJLFuJP5ACJkC8A0kBG7tgTTMBncALSIPLJR6AJyMlsWXLYVs9w79xZ3bd7n6q9q961zxM8CVL3OrVH9Pr1OVV9v/V3//69BwDgXL5V/wcAYH8CAABOSAAAwAkJAAA4IQEAACckAADghAQAAJyQAACAExIAAHBCAgAATkgAAMAJCQAAOCEBAAAnJAAA4IQEAACckAAAgBMSAABwQgIAAE5IAADACQkAADghAQAAJyQAAOCEBAAAnJAAAIATEgAAcEICAABOSAAAwAkJAAA4IQEAACckAADghAQAAJyQAACAExIAAHBCAgAATkgAAMAJCQAAOCEBAAAnJAAA4IQEAACckAAAgBMSAABwQgIAAE5IAADACQkAADghAQAAJyQAAOCEBAAAnJAAAIATEgAAcEICAABOaKsA+PYPv/vwt//6LwCwxOOeqbunq60C4PE/zt98558BYInHPVN3T1cCAAAGCYBQAgCAlQRAKAEAwEoCIJQAAGAlARBKAACwkgAIJQAAWEkAhBIAAKwkAEIJAABWEgChBAAAKwmAUAIAgJUEQCgBAMBKAiCUAABgJQEQSgAAsJIACCUAAFhJAIQSAACsJABCCQAAVhIAoQQAACsJgFACAICVBEAoAQDASgIglAAAYCUBEEoAALCSAAglAABYSQCEEgAArCQAQgkAAFYSAKEEAAArCYBQAgCAlQRAKAEAwEoCIJQAAGAlARBKAACwkgAIJQAAWEkAhBIAAKwkAEIJAABWEgChBAAAKwmAUAIAgJUEQCgBAMBKAiCUAABgJQEQSgAAsJIACCUAAFhJAIQSAACsJABC7RQA3/vZTx5+9Z//AdDa48+y+vOtMwEQaqcAePw/zv/+3/8AtPb4s6z+fOtMAIQSAABZBEAuARBKAAA7EAC5BEAoAQDsQADkEgChBACwAwGQSwCEEgDADgRALgEQSgAAOxAAuQRAKAEA7EAA5BIAoQQAsAMBkEsAhBIAwA4EQC4BEEoAADsQALkEQCgBAOxAAOQSAKEEALADAZBLAIQSAMAOBEAuARBKAAA7EAC5BEAoAQDsQADkEgChBACwAwGQSwCEEgDADgRALgEQSgAAOxAAuQRAKAEA7EAA5BIAoQQAsAMBkEsAhBIAwA4EQC4BEEoAADsQALkEQCgB0M9///bfTqO+dngfAZBLAIQSAP3UJXlG9UxAAOQSAKEEQD91GSIIEADJBEAoAdBPXX58rZ4V5yEAcgmAUAKgn7r0eKqeGfsTALkEQCgB0E9ddrxfPTv2JQByCYBQAqCfuuR4WT0/9iQAcgmAUAKgn7rgeF09Q/YjAHIJgFACoJ+63BhTz5G9CIBcAiCUAOinLjbG1bNkHwIglwAIJQD6qUuNY+p5sgcBkEsAhBIA/dSFxnH1TOlPAOQSAKEEQD91mXFcPVP6EwC5BEAoAdBPXWZcpp4rvQmAXAIglADopy4yLlfPlr4EQC4BEEoA9FOXGJerZ0tfAiCXAAglAPqpS4zr1POlJwGQSwCEEgD91AXGder50pMAyCUAQgmAfuoCm6XOuZV6HfdQr4l+BEAuARBKAPRTl9csdc491Wtbrc6nHwGQSwCEEgD91OU1S52ToF7jSnU2vQiAXAIglADopy6uWeqcJPVaV6gz6UUA5BIAoQRAP3VxzVLnpKnXO1udRy8CIJcACCUA+qmLa5Y6J1G95pnqLHoRALkEQCgB0E9dXLPUOYnqNc9UZ9GLAMglAEIJgH7q4pqlzklVr3uWOodeBEAuARBKAPRTF9csdU6qet2z1Dn0IgByCYBQAqCfurhmqXNS1euepc6hFwGQSwCEEgD91MU1S52Tql73LHUOvQiAXAIglADopy6uWeqcZPXaZ6gz6EUA5BIAoQRAP3VxzVLnJKvXPkOdQS8CIJcACCUA+qmLa5Y6J1m99hnqDHoRALkEQCgB0E9dXLPUOcnqtc9QZ9CLAMglAEIJgH7q4pqlzklWr32GOoNeBEAuARBKAPRTF9csdU6qet2z1Dn0IgByCYBQAqCfurhmqXNS1eueoc6gHwGQSwCEEgD91OU1S52Tql73DHUG/QiAXAIglADopy6vWeqcRPWaZ6lz6EcA5BIAoQRAP3V5zVLnpKnXO0udQ08CIJcACCUA+qkLbJY6J0m91pnqLHoSALkEQCgB0E9dYLPUOSnqdc5UZ9GXAMglAEIJgH7qEpulzrm3en2z1Xn0JgByCYBQAqCfushmqXPupV7XKnUuvQmAXAIglADopy6yWeqc1er8W6rXQn8CIJcACCUA+qnLjGPqebIHAZBLAIQSAP3Uhca4epbsQwDkEgChBEA/dakxpp4jexEAuQRAKAHQT11svK6eIfsRALkEQCgB0E9dbrysnh97EgC5BEAoAdBPXXC8Xz079iUAcgmAUAKgn7rkeKqeGfsTALkEQCgB0E9ddnytnhXnIQByCYBQAqCfuvR4Xj039iYAcgmAUAKgn7roeFk9P/YkAHIJgFACoJ+64BhTz5G9CIBcAiCUAOinLjaOqefJHgRALgEQSgD0Uxcax9UzpT8BkEsAhBIA/dRlxuXq2dKXAMglAEIJgH7qEuM69XzpSQDkEgChBEA/dYFxvXrG9CMAcgmAUAKgn7q8mKOeM70IgFwCIJQA6KcuLuao50wvAiCXAAglAPqpi2uWOueW6rXcS70u+hAAuQRAKAHQT11as9Q5Ceo13kK9BnoQALkEQCgB0E9dWLPUOUnqta5UZ9ODAMglAEIJgH7qwpqlzklUr3mVOpd8AiCXAAglAPqpy2qWOidVve4V6kzyCYBcAiCUAOinLqtZ6pxk9dpXqDPJJgByCYBQAqCfuqhmqXPS1eufrc4jmwDIJQBCCYB+6qKapc7poL6G2eo8cgmAXAIglADopy6pWeqcDuprmK3OI5cAyCUAQgmAfuqSmqXO6aK+jpnqLHIJgFwCIJQA6KcuqVnqnC7q65ipziKXAMglAEIJgH7qkpqlzumivo7Z6jwyCYBcAiCUAOinLqhZ6pxO6muZqc4ikwDIJQBCCYB+6oKapc7ppL6WmeosMgmAXAIglADopy6oWeqcTuprmanOIpMAyCUAQgmAfuqCmqXO6aS+lpnqLDIJgFwCIJQA6KcuqFnqnE7qa5mpziKTAMglAEIJgH7qgpqlzumkvpaZ6iwyCYBcAiCUAOinLqhZ6pxO6muZqc4ikwDIJQBCCYB+6oKapc7por6O2eo8MgmAXAIglADopy6oWeqcLurrmK3OI5MAyCUAQgmAfuqCmqXO6aK+jpnqLHIJgFwCIJQA6KcuqVnqnA7qa5itziOXAMglAEIJgH7qkpqlzklXr3+FOpNcAiCXAAglAPqpS2qWOiddvf4V6kxyCYBcAiCUAOinLqlZ6pxU9bpXqXPJJgByCYBQAqCfuqhmqXMS1Wteqc4mmwDIJQBCCYB+6qKapc5JU693tTqfbAIglwAIJQD6qYtqljonQb3GW6nXQT4BkEsAhBIA/dRlNUuds0qdm6heM/kEQC4BEEoA9FOXFXPV86YHAZBLAIQSAP3UhcVc9bzpQQDkEgChBEA/dWExTz1r+hAAuQRAKAHQT11azFPPmj4EQC4BEEoA9FOXFnPUc6YXAZBLAIQSAP3UxcX16hnTjwDIJQBCCYB+6vLievWM6UcA5BIAoQRAP3V5cZ16vvQkAHIJgFACoJ+6wLhcPVv6EgC5BEAoAdBPXWJcpp4rvQmAXAIglADopy4yjqtnSn8CIJcACCUA+qnLjGPqebIHAZBLAIQSAP3UhcaYeo7sRQDkEgChBEA/dbHxunqG7EcA5BIAoQRAP3W58X717NiXAMglAEIJgH7qkuOb6nlxDgIglwAIJQD6qQsPSx8BkEwAhBIA/dTldxb1HOBdAiCXAAglAIAdCIBcAiCUAAB2IAByCYBQAgDYgQDIJQBCCQBgBwIglwAIJQCAHQiAXAIglAAAdiAAcgmAUAIA2IEAyCUAQgkAYAcCIJcACCUAgB0IgFwCIJQAAHYgAHIJgFACANiBAMglAEIJAGAHAiCXAAglAIAdCIBcAiCUAAB2IAByCYBQAgDYgQDIJQBCCQBgBwIglwAIJQCAHQiAXAIglAAAdiAAcgmAUAIA2IEAyCUAQgkAYAcCIJcACCUAgB0IgFwCIJQAAHYgAHIJgFACANiBAMglAEIJAGAHAiCXAAglAIAdCIBcAiCUAAB2IAByCYBQAgDYgQDIJQBCCQBgBwIglwAIJQCAHQiAXAIglAAAdiAAcgmAUAIA2IEAyCUAQgkAYAcCIJcACCUAgB0IgFwCIJQAAHYgAHIJgFACANiBAMglAEIJAGAHAiCXAAglAIAdCIBcAiCUAAB2IAByCYBQAgDYgQDIJQBCCQBgBwIglwAIJQCAHQiAXAIglAAAdiAAcgmAUAJgB58/fPzjf3z4+w//YcjPP61fD/0JgFwCIJQAaOqLjx++/+H40n+fD3788cMf6/eO8NuHnw+8vg9++dtnvvZCn/7iyfd/joDKJAByCYBQAqCZwSV11Acf/uLhd3XWXQkAjhEAuQRAKAHQxbHb/Jf6/iefPzP7HgQAxwiAXAIglADoYGwZzjJ1qV5s7DVPvVYB0JoAyCUAQgmAdLf5zb+6/50AAcAxAiCXAAglALL97pevL8FV7rvoBADHCIBcAiCUAAg26Z3+l7rvGwMFAMcIgFwCIJQAyHX0t//XluEfP/nBk695zf0eBQgAjhEAuQRAKAGQamwBPjq6pI+EwP3+TsDY6xcAvCEAcgmAUAIg1OJlNBoBH3z4g4ePv3j69esJAI4RALkEQCgBkGlkQV/32/n4pwuO3mGYQwBwjADIJQBCCYBMI8//r17Mgwtv6pIdJgA4RgDkEgChBECmkQC4fvkNLtmr7jRcavDarj6DdwiA1gRALgEQSgBkGgqAqz+mN/YYQAB8kwDIJAByCYBQAiDTSAA8mroAowgAjhEAuQRAKAGQaeRNgG/c7536KwkAjhEAuQRAKAEQ6sK/Anj1GwNjCACOEQC5BEAoAZBq7Pn8S6Yux5sTABwjAHIJgFACINjgQhrV6+6AAOAYAZBLAIQSAMmuvwvwPtd/gmC1sQC4BwGQSQDkEgChBEC4C98LcMR9Pub3GgHAMQIglwAIJQAaGLw1fa2suwICgGMEQC4BEEoANHGjCHg09bn6xQQAxwiAXAIglADo5HZL8f53A273Wo8SAJkEQC4BEEoANHSjuwH3jQABwDECIJcACCUAGtv6DYICgGMEQC4BEEoA7OHInw4+6j5/P0AAcIwAyCUAQgmAHc1dnvd5FDD2Gqa+YXHw0YoAyCQAcgmAUALgBCY8Krj90hMAHCMAcgmAUALgbC7764JTF+0QAcAxAiCXAAglAM7rd798fcG+cfvHAAKAYwRALgEQSgCc2+ibBz/48AcPH3/x9OvXEQAcIwByCYBQAiDd01v2cz+a9/T7P0cAfE0AZBIAuQRAKAGQZeQ38tnLeGTmo9suPgHAMQIglwAIJQDC3GMJ3WPmqwQAxwiAXAIglAAIM/iRvZmPAUbuAMy+6/A6AcAxAiCXAAglANKMPZOft4jG5gmAr805d2YTALkEQCgBkGf043lTPpo3uPRm3nEYIwA4RgDkEgChBECgwUX06KrFPPi44cs5MxftEAHAMQIglwAIJQASjd2Wf+Oi2/ODy+6N2y89AcAxAiCXAAglAEINLqPqteU0+njhXVfdZbiYAOAYAZBLAIQSAKmO3QVY6T4LTwBwjADIJQBCCYBkY0twpakL9pCx1z71+gRAawIglwAIJQDCHXij3mz3ufX/hgDgGAGQSwCEEgANDC6mme67/B8JAI4RALkEQCgB0MXYQpxh6lK92NjrnXqtAqA1AZBLAIQSAL2M/NneS130ccJlBADHCIBcAiCUAGhqcFmNuP/t/ucIAI4RALkEQCgBsIcjn+/P+k0f5hAAuQRAKAEA7EAA5BIAoQQAsAMBkEsAhBIAwA4EQC4BEEoAADsQALkEQCgBAOxAAOQSAKEEALADAZBLAIQSAMAOBEAuARBKAAA7EAC5BEAoAQDsQADkEgChBACwAwGQSwCEEgDADgRALgEQSgAAOxAAuQRAKAEA7EAA5BIAoQRAot8/fPZP33n4r5v56cPnsf864OBZfPT7Z772Qp/++un3f83M+VxEAOQSAKEEQKLBpbfKj37z8Jcn13Qvg2cxawF/8ZuHP9Tv/ZpZs7mKAMglAEIJgESDS2+1iMU2eBYzrtXyb00A5BIAoQRAosGldxO/fvjzk+u7pcGzuHoRD855V9SdEgRALgEQSgAkumAZLXXPCBg8i6sCYHDGuyz/OAIglwAIJQASXbCQVrtqwV5j8Cwuvr4/PXz+o2e+30ss/0gCIJcACCUAEg0uvRv77NN6nbcweBYXBYDlvxMBkEsAhBIAiQaX3q3dZfkNnsUFAfDnj575Pi+5y+tnlADIJQBCCYBE65beu/7yyU+ffs8X3ePvBaw5i8PL/67vg2CEAMglAEIJgERrlt7zjt0G/8Mnf3rme6w0/yyOh4/l34EAyCUAQgmARPOX3ssORMC0maPmnoXlvy8BkEsAhBIAieYuvSGjf/725s/B552F5b83AZBLAIQSAInmLb1hw38F79ZLcdJZjAbOW7d+nVxLAOQSAKEEQKJJS++QwZk3X4yD1/XSWVj+pyAAcgmAUAIg0YSld9jgzJsvx8Hret9ZDN/ZeOMen3RgBgGQSwCEEgCJrlx6lxhdlJ3eAzD6mt6y/DsTALkEQCgBkOiKpXeh4TfITZw55tKzGPy6tyz/7gRALgEQSgAkGlxeT5bepQbntfk7AINf85blvwMBkEsAhBIAiQYX2JQAGJz1pXssysHre3sWB/6mwZfu8ZpYQQDkEgChBECio0vvEkcX5bXzLnXkLC54TY9u/r4GVhAAuQRAKAGQaHDp3dS9flMePIuPfn/B3/f/2u0fbTCbAMglAEIJgESDS++G7rcgb3UW9wocZhEAuQRAKAGQ6FZLb9Bdbv2/ccOz8CigNQGQSwCEEgCJbrj0XnPX5f/otmfx2ad1Pl0IgFwCIJQASHTbpfc+Gcvw1mdx6790yCwCIJcACCUAEt166X1TxuJ/Y85ZfPbRgX8P4O53PbiEAMglAEIJgERzlt645N96rz+Lr4Lm2EcEsyKIEQIglwAIJQASXb/0jrjfO/xHXHcW33hth/5tgOQo4jkCIJcACCUAEg0uvRduVR//THzqwhs8i2c8FzaHzuWF8yWPAMglAEIJgESDS+/VBXXstnfmZ+EHz6J4bvlf8v08CuhDAOQSAKEEQKLBJfVqAHzl0G+9cUtv8Cze8f7l/5Xhf/nwkb8N0IYAyCUAQgmARINLbzAAet8JGDyLv3pt+a/7ntybAMglAEIJgESDC2o4AI6+Ae5RynsCBs/i6KL+9MDHAqOCiPcRALkEQCgBkGhw6R0JgEeHlt4F33+JRWdx9K6IRwHxBEAuARBKACRatfQ6vh9g3VkcvSty6A4DNycAcgmAUAIg0cKlN/q937r3o4DB673oLI4GkUcByQRALgEQSgAkWrv0ej0KWHwWo9//6jmsJgByCYBQAiDR4FK6Yhkd+833no8C1p/FoY8F3vUseIkAyCUAQgmAROuX3vCMt+71KGDwOq86i4NvCLzbWfASAZBLAIQSAIlusfS6PApwFowRALkEQCgBkOhGS+/wo4B7vAku9Sw8CkgjAHIJgFACINHtlt7wrDdu/nn4weubcRYHPxboUUAWAZBLAIQSAIluuPQeHbz9fdvPw9/2LI6+IfC2Z8FLBEAuARBKACS67dJ7dOz29y0fBdz6LAbnvXXLs+AlAiCXAAglABINLqFpS+/R4Mwls18yeF0zr+fgHZHbPxbhOQIglwAIJQAS3WHpPTq4+G7zJrh7nMXRjwV6FJBAAOQSAKEEQKJ7LL2vHHsUcIs3wd3pLA6/IdCjgHsTALkEQCgBkOhOS+9Lg7P/av1vvoPXs+AsjsWQRwH3JgByCYBQAgDYgQDIJQBCCQBgBwIglwAIJQCAHQiAXAIglAAAdiAAcgmAUAIA2IEAyCUAQgkAYAcCIJcACCUAgB0IgFwCIJQAAHYgAHIJgFACANiBAMglAEIJAGAHAiCXAAglAIAdCIBcAiCUAAB2IAByCYBQAgDYgQDIJQBCCQBgBwIglwAIJQCAHQiAXAIglAAAdiAAcgmAUAIA2IEAyCUAQgkAYAcCIJcACCUAgB0IgFwCIJQAAHYgAHIJgFACANiBAMglAEIJAGAHAiCXAAglAIAdCIBcAiCUAAB2IAByCYBQAgDYgQDIJQBCCQBgBwIglwAIJQCAHQiAXAIglAAAdiAAcgmAUAIA2IEAyCUAQgkAYAcCIJcACCUAgB0IgFwCIJQAAHYgAHIJgFACANiBAMglAEIJAGAHAiCXAAglAIAdCIBcAiCUAAB2IAByCYBQAgDYgQDIJQBCCQBgBwIglwAIJQCAHQiAXAIglAAAdiAAcgmAUAIA2IEAyCUAQn3vZz/58v84AJ09/iyrP986EwChdgoAAPIIgFACAICVBEAoAQDASgIglAAAYCUBEEoAALCSAAglAABYSQCEEgAArCQAQgkAAFYSAKEEAAArCYBQAgCAlQRAKAEAwEoCIJQAAGAlARBKAACwkgAIJQAAWEkAhBIAAKwkAEIJAABWEgChBAAAKwmAUAIAgJUEQCgBAMBKAiCUAABgJQEQSgAAsJIACCUAAFhJAIQSAACsJABCCQAAVhIAoQQAACsJgFACAICVBEAoAQDASgIglAAAYCUBEEoAALCSAAglAABYSQCEEgAArCQAQgkAAFYSAKEEAAArCYBQAgCAlQRAKAEAwEoCIJQAAGAlARBKAACwkgAIJQAAWEkAhBIAAKwkAEIJAABWEgChvv3D7375HwcAVnjcM3X3dLVVAAAAYwQAAJyQAACAExIAAHBCAgAATkgAAMAJCQAAOCEBAAAnJAAA4IQEAACckAAAgBMSAABwQgIAAE5IAADACQkAADghAQAAJyQAAOCEBAAAnJAAAIATEgAAcEICAABOSAAAwAkJAAA4IQEAACckAADghAQAAJyQAACAExIAAHBCAgAATkgAAMAJCQAAOCEBAAAnJAAA4IQEAACckAAAgBMSAABwQgIAAE5IAADACQkAADghAQAAJyQAAOCEBAAAnJAAAIATEgAAcEICAABOSAAAwAkJAAA4IQEAACckAADghAQAAJzQ/wPKt2i12MjEcAAAAABJRU5ErkJggg==", type: "image/png" },
+  "/apple-touch-icon.png": { base64: "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", type: "image/png" },
+};
+
+function base64ToBytes(value) {
+  const raw = atob(value);
+  const bytes = new Uint8Array(raw.length);
+  for (let index = 0; index < raw.length; index += 1) bytes[index] = raw.charCodeAt(index);
+  return bytes;
+}
+
+function assetResponse(asset) {
+  const body = asset.base64 ? base64ToBytes(asset.base64) : asset.body;
+  return new Response(body, { headers: { "content-type": asset.type, "cache-control": "no-store" } });
+}
+
+async function serveAsset(request, env) {
+  const url = new URL(request.url);
+  let pathname = url.pathname;
+  if (pathname === "/" || pathname === "") pathname = "/index.html";
+  const asset = EMBEDDED_ASSETS[pathname] || EMBEDDED_ASSETS["/index.html"];
+  return assetResponse(asset);
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/api/")) return handleApi(request, env);
+    return serveAsset(request, env);
+  },
+};
