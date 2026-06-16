@@ -2,3 +2,8 @@ name = "bridge-bied-app"
 main = "src/index.js"
 compatibility_date = "2026-06-14"
 workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "bridge-bied-db"
+database_id = "3fb8cc38-47ac-486c-b2e3-dc73d43c820a"
