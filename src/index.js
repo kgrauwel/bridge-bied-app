@@ -669,6 +669,10 @@ async function handleApi(request, env) {
   const seat = normalizeSeat(url.searchParams.get("seat") || body.seat);
 
   try {
+    if (request.method === "GET" && url.pathname === "/api/health") {
+      return json({ appVersion: APP_VERSION, dbConnected: Boolean(env.DB) });
+    }
+
     if (request.method === "GET" && url.pathname === "/api/players") {
       return json({ players: playerList(registry) });
     }
