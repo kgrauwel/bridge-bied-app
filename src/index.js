@@ -1,4 +1,4 @@
-const APP_VERSION = "2026-06-17-better-ew-par-v4";
+const APP_VERSION = "2026-06-17-better-ew-par-v5";
 const MAIN_SESSION_PREFIX = "session:";
 const PLAYER_REGISTRY_KEY = "players";
 const SEATS = ["N", "E", "S", "W"];
@@ -483,7 +483,23 @@ function honorControls(hand) {
   return hand.reduce((total, card) => total + (card.rank === "A" ? 2 : card.rank === "K" ? 1 : 0), 0);
 }
 
-function maxReasonableLevel(stats, controls, strain) {
+function hasCombinedRanks(hand, suit, ranks) {
+  const owned = new Set(hand.filter((card) => card.suit === suit).map((card) => card.rank));
+  return ranks.every((rank) => owned.has(rank));
+}
+
+function hasLongTrickSource(hand, stats) {
+  return SUITS.some((suit) => {
+    const length = stats.distribution[suit];
+    if (length >= 8 && hasCombinedRanks(hand, suit, ["A", "K", "Q"])) return true;
+    if (length >= 7 && hasCombinedRanks(hand, suit, ["A", "K", "Q", "J"])) return true;
+    return false;
+  });
+}
+
+function maxReasonableLevel(stats, controls, strain, hand) {
+  const longSource = hasLongTrickSource(hand, stats);
+  if (stats.hcp >= 33 && controls >= 10 && longSource) return 7;
   if (stats.hcp >= 37 && controls >= 9) return 7;
   if (stats.hcp >= 32 && controls >= 7) return 6;
   if (strain === "NT") {
@@ -519,6 +535,7 @@ function estimateTricks(deal, side, strain) {
   }
   if (controls >= 7) estimate += 0.25;
   if (controls <= 3) estimate -= 0.35;
+  if (stats.hcp >= 33 && controls >= 10 && hasLongTrickSource(hand, stats)) estimate = Math.max(estimate, 13);
   if (stats.hcp >= 33 && controls >= 7) estimate = Math.max(estimate, 12);
   if (stats.hcp >= 37 && controls >= 9) estimate = Math.max(estimate, 13);
   return Math.max(0, Math.min(13, Math.floor(estimate + 0.45)));
@@ -531,7 +548,7 @@ function bestContractForSide(deal, side) {
   const controls = honorControls(hand);
   for (const strain of STRAINS) {
     const tricks = estimateTricks(deal, side, strain);
-    const maxLevel = Math.max(0, Math.min(7, tricks - 6, maxReasonableLevel(stats, controls, strain)));
+    const maxLevel = Math.max(0, Math.min(7, tricks - 6, maxReasonableLevel(stats, controls, strain, hand)));
     for (let level = 1; level <= maxLevel; level += 1) {
       const bid = `${level}${strain}`;
       const score = contractScoreMade(bid, sideVulnerable(side, deal.vulnerability));
