@@ -20,7 +20,7 @@ var Module=moduleArg;var readyPromiseResolve,readyPromiseReject;var readyPromise
 
 
 
-const APP_VERSION = "2026-06-19-dds-v6";
+const APP_VERSION = "2026-06-19-dds-v7";
 const MAIN_SESSION_PREFIX = "session:";
 const PLAYER_REGISTRY_KEY = "players";
 const ADMIN_SETTINGS_KEY = "admin-settings";
@@ -666,6 +666,19 @@ function ddsParContractLabel(contract) {
   return `${side} ${displayCall(call)}${doubleText}${resultText}`;
 }
 
+function normalizeDdsPar(par) {
+  if (!par) return par;
+  const primary = Array.isArray(par.contracts) && par.contracts[0] ? par.contracts[0] : par.label;
+  const info = ddsParContractInfo(primary);
+  if (!info) return par;
+  return {
+    ...par,
+    side: info.side,
+    bid: info.call,
+    label: ddsParContractLabel(primary),
+  };
+}
+
 function readDdsDealerParFromPointer(module, parPointer) {
   const number = module.getValue(parPointer, "i32");
   const score = module.getValue(parPointer + 4, "i32");
@@ -882,7 +895,7 @@ function bestDoubleDummyContractForSide(deal, ddTable, side) {
 
 function indicativePar(deal, ddTable = null) {
   if (ddTable?.par) {
-    return ddTable.par;
+    return normalizeDdsPar(ddTable.par);
   }
   const ns = ddTable ? bestDoubleDummyContractForSide(deal, ddTable, "NZ") : bestContractForSide(deal, "NZ");
   const ow = ddTable ? bestDoubleDummyContractForSide(deal, ddTable, "OW") : bestContractForSide(deal, "OW");
