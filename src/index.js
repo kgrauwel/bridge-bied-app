@@ -20,7 +20,7 @@ var Module=moduleArg;var readyPromiseResolve,readyPromiseReject;var readyPromise
 
 
 
-const APP_VERSION = "2026-06-19-dds-v5";
+const APP_VERSION = "2026-06-19-dds-v6";
 const MAIN_SESSION_PREFIX = "session:";
 const PLAYER_REGISTRY_KEY = "players";
 const ADMIN_SETTINGS_KEY = "admin-settings";
@@ -647,21 +647,23 @@ function readDdsTableFromPointer(module, tablePointer) {
 
 function ddsParContractInfo(contract) {
   const clean = String(contract || "").trim();
-  const match = clean.match(/^([1-7])([CDHSN])([X]*)-([NSEW]{1,2})$/);
+  const match = clean.match(/^([1-7])([CDHSN])([*X]{0,2})-([NSEW]{1,2})([+=-]\d+|=)?$/);
   if (!match) return null;
-  const [, level, strainCode, doubled, sideText] = match;
+  const [, level, strainCode, doubledText, sideText, result = ""] = match;
   const strain = strainCode === "N" ? "NT" : strainCode;
+  const doubled = doubledText.replace(/\*/g, "X");
   const side = ["N", "S", "NS"].includes(sideText) ? "NZ" : "OW";
-  return { call: `${level}${strain}`, doubled, side, sideText };
+  return { call: `${level}${strain}`, doubled, side, sideText, result };
 }
 
 function ddsParContractLabel(contract) {
   const clean = String(contract || "").trim();
   const info = ddsParContractInfo(clean);
   if (!info) return clean;
-  const { call, doubled, side } = info;
+  const { call, doubled, side, result } = info;
   const doubleText = doubled === "XX" ? " geredubbeld" : doubled === "X" ? " gedubbeld" : "";
-  return `${side} ${displayCall(call)}${doubleText}`;
+  const resultText = result ? ` ${result}` : "";
+  return `${side} ${displayCall(call)}${doubleText}${resultText}`;
 }
 
 function readDdsDealerParFromPointer(module, parPointer) {
